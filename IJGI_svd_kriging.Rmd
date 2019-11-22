@@ -1,0 +1,398 @@
+---
+title: "Code for IJGI Publication"
+output: html_notebook
+---
+
+##### Set up environment to run R and Python
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Set up environment to run R and Python
+library(dplyr) # standard library
+library(ggplot2) # standard library
+library(reticulate) # package to run Python in R notebook
+library(tm) # dtm, stopwords
+library(tibble) # rownames_to_columns
+library(visNetwork)
+library(networkD3)
+library(tidyverse)
+library(data.table) # na.omit, read in faster csv
+library(tidytext) #cast_dtm, unnest_tokens
+library(textstem) # lemmatization
+library(stringr) # str_replace
+library(tidyr) # separate function
+library(textreadr)
+library(Metrics) # rmse
+library(readxl) # read xlsx
+library(dplyr)
+library(gstat)
+library(sp)
+library(MLmetrics)
+
+setwd('your/file/path')
+use_python("your/file/path/Anaconda3/python.exe")
+```
+
+
+```{r}
+
+# Combine Train and Test Data
+###########################################################################
+properties <- fread('your/file/path/data/properties_2016.csv', header = T, sep = ',', stringsAsFactors = FALSE) %>% 
+  select(parcelid,latitude, longitude, structuretaxvaluedollarcnt,
+         bathroomcnt, bedroomcnt, calculatedfinishedsquarefeet, lotsizesquarefeet, propertylandusetypeid, regionidcounty)
+
+train <-fread('your/file/path/data/train_2016_v2.csv', header = T, sep = ',', stringsAsFactors = FALSE) %>% 
+  inner_join(properties, by=c('parcelid')) %>% ungroup() %>% 
+  mutate(price_change_svd=0) %>% 
+  filter(!str_detect(transactiondate, "2016-10-\\d+") & !str_detect(transactiondate, "2016-11-\\d+") & 
+           !str_detect(transactiondate, "2016-12-\\d+"))%>% 
+  select(parcelid,price_change_svd,latitude, longitude, structuretaxvaluedollarcnt,
+         bathroomcnt, bedroomcnt, calculatedfinishedsquarefeet, lotsizesquarefeet, propertylandusetypeid, transactiondate, regionidcounty) %>%
+  mutate(latitude = latitude/1000000, longitude = longitude/1000000) %>% 
+  na.omit()
+
+
+test <- fread('your/file/path/data/train_2016_v2.csv', header = T, sep = ',', stringsAsFactors = FALSE) %>% 
+  inner_join(properties, by=c('parcelid')) %>% ungroup() %>%
+  filter(str_detect(transactiondate, "2016-10-\\d+") | str_detect(transactiondate, "2016-11-\\d+") | str_detect(transactiondate, "2016-12-\\d+")) %>%
+  na.omit() %>% 
+  mutate(price_change_svd=1) %>% 
+  select(parcelid,price_change_svd,latitude, longitude, structuretaxvaluedollarcnt,
+         bathroomcnt, bedroomcnt, calculatedfinishedsquarefeet, lotsizesquarefeet, propertylandusetypeid, transactiondate, regionidcounty) %>%
+  mutate(latitude = latitude/1000000, longitude = longitude/1000000)
+
+
+df_1 <- bind_rows(train, test)
+saveRDS(df_1, 'your/file/path/data/df_1.rds')
+fwrite(df_1, 'your/file/path/data/df_1.csv', sep=",")
+
+
+rm(test)
+rm(train)
+rm(properties)
+gc()
+###########################################################################
+
+
+
+
+# Prep Data
+########################################################################### 
+out_df <- df_1  %>% mutate(COUNTY=as.character(regionidcounty)) %>% select(-regionidcounty)
+
+canonical_matrix <- out_df %>%
+  rename(price = structuretaxvaluedollarcnt) %>% 
+  mutate(price= price/10000000) %>%
+  mutate(topics = paste(bedroomcnt,bathroomcnt, sep="_")) %>% 
+  distinct(topics, latitude, longitude, .keep_all = TRUE) %>%
+  na.omit() %>% 
+  mutate(location_id=group_indices(., latitude, longitude))  %>% 
+  mutate(latitude=as.numeric(latitude), longitude=as.numeric(longitude)) %>% 
+  mutate(topic_id=group_indices(., topics)) %>% 
+  select(-bathroomcnt, -bedroomcnt) %>% 
+  mutate(latitude=as.numeric(latitude), longitude=as.numeric(longitude))
+
+saveRDS(canonical_matrix, file="your/file/path/data/canonical_matrix.rds")
+
+
+rm(out_df)
+gc()
+###########################################################################
+
+
+
+# Prep for SVD - Incorporate all Zillow as Train
+###########################################################################
+canonical_matrix <- canonical_matrix
+
+# change test prices to 0 for SVD
+svd_input <- canonical_matrix %>% 
+  select(location_id, topic_id, price, COUNTY, price_change_svd) %>% 
+  distinct(location_id, topic_id, .keep_all = TRUE) %>% 
+  mutate(price = if_else(price_change_svd==1, 0, price))
+
+# save csv and load into SVD with SGD
+fwrite(svd_input, 'your/file/path/data/svd_input_all.csv', sep=",") 
+###########################################################################
+```
+
+##### Run SVD in Python
+```{python}
+from surprise import BaselineOnly
+from surprise.model_selection import train_test_split
+from surprise import SVD
+from surprise import Dataset
+from surprise import accuracy
+from surprise import Reader
+from surprise import trainset
+from surprise.model_selection import KFold
+from surprise import dump
+import surprise
+import numpy as np
+import pandas as pd
+import random
+import os
+import gc
+import datetime
+import matplotlib.pyplot as plt
+
+chunks = pd.read_csv('your/file/path/data/svd_input_all.csv', chunksize=100000, encoding='utf-8')
+ratings = pd.concat(chunks).loc[:,['location_id', 'topic_id', 'price', 'price_change_svd', 'COUNTY']].rename(columns={"location_id": "n_users", "topic_id":"item_id", "price":"raw_ratings"})
+del chunks
+reader = Reader(rating_scale=(0,1))
+full_df = pd.DataFrame()
+        
+print('Select Method...')
+bsl_options = {'method': 'sgd',
+               'learning_rate': .00005,
+               'n_epochs':1000,
+               'reg':.00002,
+               }
+
+algo = BaselineOnly(bsl_options=bsl_options) 
+
+
+# Apply SVD with SGD for every city
+city_list = pd.Series(ratings['COUNTY']).unique()
+for i in city_list:
+    # prep data into appriopriate data containers
+    rating = ratings[ratings['COUNTY']==i]
+    data = Dataset.load_from_df(rating[['n_users', 'item_id', 'raw_ratings']], reader)
+    trainset= data.build_full_trainset()
+    
+    # train and test algorithm.
+    algo.fit(trainset)
+    testset = trainset.build_testset()
+    predictions = algo.test(testset)
+    df = pd.DataFrame(predictions, columns=['location_id', 'topic_id', 'rui', 'freq_svd', 'details']).drop(["rui","details"], axis=1)
+    full_df = full_df.append(df, ignore_index = True) 
+
+
+full_df.to_csv('your/file/path/data/svd_output_all.csv', index=False, chunksize=100000)
+gc.collect()
+```
+
+
+```{r}
+
+# Prep for SVD - Incorporate all Zillow as Train
+###########################################################################
+
+# change test prices to 0 for SVD
+svd_input <- canonical_matrix %>% 
+  select(location_id, topic_id, price, COUNTY, price_change_svd) %>% 
+  distinct(location_id, topic_id, .keep_all = TRUE) %>% 
+  mutate(price = if_else(price_change_svd==1, 0, price))
+
+# save csv and load into SVD with SGD
+fwrite(svd_input, 'your/file/path/data/svd_input_all.csv', sep=",") 
+###########################################################################
+
+
+
+
+# Joining SVD Results with Canonical Matrix
+###########################################################################
+# ntegrate SVD
+# join lat/long and additional info to svd_output
+svd_output <- fread('your/file/path/data/svd_output_all.csv', header = TRUE, sep = ',', stringsAsFactors = FALSE, col.names = c("location_id", "topic_id", "freq_svd")) %>%
+  data.frame()
+
+gc()
+
+full_original_df <- canonical_matrix %>%  mutate(COUNTY=as.character(COUNTY)) %>% 
+  left_join(svd_input, by=c("location_id", "topic_id","price_change_svd", "COUNTY")) %>%
+  rename(original_price = price.x, svd_input_price = price.y) %>%
+  inner_join(svd_output, by=c("location_id", "topic_id"))
+
+
+# Project Coordinates
+coordinates(full_original_df) <- c("longitude", "latitude")
+proj4string(full_original_df) <- CRS("+proj=longlat +datum=WGS84")
+
+res <- spTransform(full_original_df, CRS("+proj=utm +ellps=WGS84 +units=us-mi"))
+full_original_df<- as.data.frame(res)
+
+
+df_main <- full_original_df %>% 
+  select(COUNTY,parcelid,topic_id, location_id, latitude, longitude, original_price, price_change_svd, freq_svd, topics, calculatedfinishedsquarefeet, lotsizesquarefeet ,transactiondate)
+
+rm(full_original_df)
+rm(res)
+gc()
+###########################################################################
+
+
+
+
+
+# Preping Data
+##########################################################################
+
+ml_spat <- df_main %>%
+  mutate(bed = str_extract(topics, "\\w_"), bed=str_replace(bed, "_", "")) %>%
+  mutate(bath = str_extract(topics, "_\\w"), bath=str_replace(bath, "_", "")) %>% 
+  mutate(bed = as.numeric(bed), bath = as.numeric(bath)) %>% 
+  select(COUNTY,parcelid,price_change_svd,freq_svd, latitude,longitude,calculatedfinishedsquarefeet,bed,bath,transactiondate, original_price) %>% 
+  na.omit() %>% 
+  mutate(freq_svd_e = original_price - freq_svd) %>% 
+  filter(COUNTY=='3101')
+
+# Finding Outliers
+#library(outliers)
+ml_spat$outlier <- scores(ml_spat$original_price, type="z", prob=0.9)
+ml_spat <- ml_spat %>% filter(outlier==FALSE)
+
+test <- ml_spat %>% filter(outlier==TRUE)
+mae(test$original_price, test$freq_svd)
+
+rm(df_main)
+gc()
+
+fwrite(ml_spat, 'data/ml_spat.csv', sep=",")
+
+
+###########################################################################
+
+
+
+
+
+# Kriging
+###########################################################################
+library(gstat)
+
+data_new <- data.frame()
+county_list = c("3101", "1285", "2061")
+for (i in county_list){
+  ml_spat <- df_main %>%
+    mutate(bed = str_extract(topics, "\\w_"), bed=str_replace(bed, "_", "")) %>%
+    mutate(bath = str_extract(topics, "_\\w"), bath=str_replace(bath, "_", "")) %>% 
+    mutate(bed = as.numeric(bed), bath = as.numeric(bath)) %>% 
+    select(COUNTY,parcelid,price_change_svd,freq_svd, latitude,longitude,calculatedfinishedsquarefeet,bed,bath,transactiondate, original_price) %>% 
+    na.omit() %>% 
+    mutate(freq_svd_e = original_price - freq_svd) %>% 
+    filter(COUNTY==i)
+  
+  data <- ml_spat %>% filter(price_change_svd==0)
+  grid <- ml_spat %>% filter(price_change_svd==1)
+  
+  coordinates(data) <- ~ longitude + latitude
+  lzn.vgm <- variogram(original_price ~ log(freq_svd)+freq_svd_e, data) # calculates sample variogram values 
+  
+  # automatically chooses the best model
+  lzn.fit = fit.variogram(lzn.vgm, vgm(c("Exp", "Gau", "Sph", "Mat")), fit.kappa = TRUE)
+  
+  coordinates(grid) <- ~ longitude + latitude
+  lzn.kriged <-krige(original_price ~ log(freq_svd), data, grid, model = lzn.fit,maxdist=.75)
+  
+  predicted <- lzn.kriged@data$var1.pred %>%
+    as.data.frame() %>%
+    rename(freq_pred_spatial = 1)
+
+  variance <- lzn.kriged@data$var1.var %>%
+    as.data.frame() %>%
+    rename(freq_var_spatial = 1)
+  
+  data_temp <- grid %>%
+    data.frame() %>%
+    mutate(
+      freq_kriging = predicted$freq_pred_spatial,
+      var_kriging = variance$freq_var_spatial
+    ) %>%
+    select(-optional) %>%  
+    na.omit() 
+  
+  data_new <- rbind(data_new, data_temp)
+
+}
+
+mae(data_new$original_price, data_new$freq_kriging)
+mae(data_new$original_price, data_new$freq_svd)
+
+
+saveRDS(data_new, file="your/file/path/data/kriging_results.rds")
+###########################################################################
+
+
+
+
+
+# Kriging with Clustering for County ID 3101
+###########################################################################
+library(stats)
+library(outliers)
+
+# Pre-processing
+ml_spat <- df_main %>%
+  mutate(bed = str_extract(topics, "\\w_"), bed=str_replace(bed, "_", "")) %>%
+  mutate(bath = str_extract(topics, "_\\w"), bath=str_replace(bath, "_", "")) %>% 
+  mutate(bed = as.numeric(bed), bath = as.numeric(bath)) %>% 
+  select(COUNTY,parcelid,price_change_svd,freq_svd, latitude,longitude,calculatedfinishedsquarefeet,bed,bath,transactiondate, original_price) %>% 
+  na.omit() %>% 
+  mutate(freq_svd_e = original_price - freq_svd) %>% 
+  filter(COUNTY=='3101')
+
+# Finding Outliers
+ml_spat$outlier <- scores(ml_spat$original_price, type="z", prob=0.9)
+ml_spat <- ml_spat %>% filter(outlier==FALSE)
+
+X <- ml_spat %>% select(latitude,longitude,freq_svd)
+kmean_df <- kmeans(X, 6, iter.max = 100, nstart = 60, algorithm = c("MacQueen"))
+ml_spat$group <- kmean_df$cluster
+gc()
+
+
+data_final = data.frame()
+seed_list = c(1,2,3,4,5,6)
+for (i in seed_list){
+  data <- ml_spat %>% filter(group==6) %>% filter(price_change_svd==0)
+  grid <- ml_spat %>% filter(group==6)%>% filter(price_change_svd==1)
+  
+  coordinates(data) <- ~ longitude + latitude
+  lzn.vgm <- variogram(original_price ~ log(freq_svd)+freq_svd_e, data) # calculates sample variogram values , width=.5, cutoff=1
+  
+  gc()
+  
+  # automatically chooses the best model
+  lzn.fit = fit.variogram(lzn.vgm, vgm(c("Exp", "Gau", "Sph", "Mat")), fit.kappa = TRUE) #, "Exp", "Gau", "Sph", "Mat"
+  lzn.fit
+  coordinates(grid) <- ~ longitude + latitude
+  lzn.kriged <-krige(original_price ~ log(freq_svd), data, grid, model = lzn.fit, maxdist=.75) # maxdist=.75
+  
+  predicted <- lzn.kriged@data$var1.pred %>%
+    as.data.frame() %>%
+    rename(freq_pred_spatial = 1)
+  
+  variance <- lzn.kriged@data$var1.var %>%
+    as.data.frame() %>%
+    rename(freq_var_spatial = 1)
+  
+  data_new <- grid %>%
+    data.frame() %>%
+    mutate(
+      freq_kriging = predicted$freq_pred_spatial,
+      var_kriging = variance$freq_var_spatial
+    ) %>%
+    select(-optional) %>%  
+    na.omit()
+  
+  data_final <- rbind(data_final, data_new)
+  
+}
+
+# Determine new MAE for clustered approach of county id 3101
+mae(data_new$original_price, data_new$freq_kriging)
+# Determine MAE of baseline (SVD)
+mae(data_new$original_price, data_new$freq_svd)
+###########################################################################
+
+
+```
+
+
+
+
+
+

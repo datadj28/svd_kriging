@@ -67,11 +67,6 @@ df_1 <- bind_rows(train, test)
 saveRDS(df_1, 'your/file/path/data/df_1.rds')
 fwrite(df_1, 'your/file/path/data/df_1.csv', sep=",")
 
-
-rm(test)
-rm(train)
-rm(properties)
-gc()
 ###########################################################################
 
 
@@ -94,15 +89,11 @@ canonical_matrix <- out_df %>%
   mutate(latitude=as.numeric(latitude), longitude=as.numeric(longitude))
 
 saveRDS(canonical_matrix, file="your/file/path/data/canonical_matrix.rds")
-
-rm(df_1)
-rm(out_df)
-gc()
 ###########################################################################
 
 
 
-# Prep for SVD - Incorporate all Zillow as Train
+# Prep for SVD algorithm
 ###########################################################################
 canonical_matrix <- canonical_matrix
 
@@ -142,8 +133,7 @@ reader = Reader(rating_scale=(0,1))
 full_df = pd.DataFrame()
         
 print('Select Method...')
-algo = surprise.prediction_algorithms.matrix_factorization.NMF(n_factors=15, n_epochs=30, verbose=True, biased=True, lr_bu=.00000005, lr_bi=.00000005,reg_pu=.05, reg_qi=.05)
-
+algo = surprise.prediction_algorithms.matrix_factorization.NMF(n_factors=5, n_epochs=70, verbose=True, biased=True, lr_bu=.00000005)
 # Apply SVD with SGD for every city
 city_list = pd.Series(ratings['COUNTY']).unique()
 for i in city_list:
@@ -167,7 +157,7 @@ gc.collect()
 
 ```{r}
 
-# Joining SVD Results with Canonical Matrix
+# Joining SVD Results Back to Main Dataframe
 ###########################################################################
 # ntegrate SVD
 # join lat/long and additional info to svd_output
@@ -182,7 +172,7 @@ full_original_df <- canonical_matrix %>%  mutate(COUNTY=as.character(COUNTY)) %>
   inner_join(svd_output, by=c("location_id", "topic_id"))
 
 
-# Project Coordinates
+# Project Coordinates for Kriging
 coordinates(full_original_df) <- c("longitude", "latitude")
 proj4string(full_original_df) <- CRS("+proj=longlat +datum=WGS84")
 
@@ -193,36 +183,28 @@ full_original_df<- as.data.frame(res)
 df_main <- full_original_df %>% 
   select(COUNTY,parcelid,topic_id, location_id, latitude, longitude, original_price, price_change_svd, freq_svd, topics, calculatedfinishedsquarefeet, lotsizesquarefeet ,transactiondate)
 
-rm(full_original_df)
-rm(res)
-gc()
 ###########################################################################
 
 
 
 
-
-# Preping Data
+# Prep Data for Kriging Algorithm
 ##########################################################################
 
 temp <- df_main %>%
   mutate(bed = str_extract(topics, "\\w_"), bed=str_replace(bed, "_", "")) %>%
   mutate(bath = str_extract(topics, "_\\w"), bath=str_replace(bath, "_", "")) %>% 
   mutate(bed = as.numeric(bed), bath = as.numeric(bath)) %>% 
-  select(COUNTY,parcelid,price_change_svd,freq_svd, latitude,longitude,calculatedfinishedsquarefeet, lotsizesquarefeet,bed,bath,transactiondate, topic_id,location_id, original_price) %>%
+  select(COUNTY,parcelid,price_change_svd,freq_svd, latitude,longitude,bed,bath,transactiondate, topic_id,location_id, original_price) %>%   
   na.omit() %>% 
   mutate(freq_svd_e = original_price - freq_svd)
-
-rm(df_main)
-gc()
-
 ###########################################################################
 
 
 
 
 
-# Segmented Regression Kriging
+# Method 1: Segmented SVD-RK
 ###########################################################################
 library(gstat)
 
@@ -240,7 +222,7 @@ for (i in county_list){
   lzn.vgm <- variogram(original_price ~ freq_svd + freq_svd_e, data) 
   
   # automatically chooses the best model
-  lzn.fit = fit.variogram(lzn.vgm, vgm(c("Exp", "Gau", "Sph", "Mat")), fit.kappa = TRUE)
+  lzn.fit = fit.variogram(lzn.vgm, vgm(c("Sph", "Mat")), fit.kappa = TRUE)
   
   coordinates(grid) <- ~ longitude + latitude
   lzn.kriged <-krige(original_price ~ freq_svd, data, grid, model = lzn.fit, maxdist=.75)
@@ -267,10 +249,6 @@ for (i in county_list){
 
 }
 
-mae(data_new$original_price, data_new$freq_kriging)
-mae(data_new$original_price, data_new$freq_svd)
-
-
 saveRDS(data_new, file="your/file/path/data/kriging_results.rds")
 ###########################################################################
 
@@ -278,7 +256,7 @@ saveRDS(data_new, file="your/file/path/data/kriging_results.rds")
 
 
 
-# Modified Segmented Regression Kriging
+# Method 2: Ordinary Kriging for Counties with Similar Spatial Structures to County Id 3101
 ###########################################################################
 library(stats)
 library(outliers)
@@ -286,24 +264,23 @@ library(outliers)
 # Filter to only county selected for outlier removal
 ml_spat <- temp %>% filter(COUNTY=="3101")
 
-# Finding Outliers
+# Remove Outliers
 ml_spat$outlier <- scores(ml_spat$original_price, type="z", prob=0.9)
 ml_spat <- ml_spat %>% filter(outlier==FALSE)
 
 data <- ml_spat %>% filter(price_change_svd==0)
 grid <- ml_spat %>% filter(price_change_svd==1)
 
-
 coordinates(data) <- ~ longitude + latitude
-lzn.vgm <- variogram(original_price ~ freq_svd + freq_svd_e, data)
+lzn.vgm <- variogram(original_price ~ 1, data)
 
 gc()
 
 # automatically chooses the best model
-lzn.fit = fit.variogram(lzn.vgm, vgm(c("Exp", "Gau", "Sph", "Mat")), fit.kappa = TRUE)
+lzn.fit = fit.variogram(lzn.vgm, vgm(c("Sph", "Mat")), fit.kappa = TRUE)
 
 coordinates(grid) <- ~ longitude + latitude
-lzn.kriged <-krige(original_price ~ freq_svd, data, grid, model = lzn.fit,maxdist=.75)
+lzn.kriged <-krige(original_price ~ 1, data, grid, model = lzn.fit,maxdist=.75)
 
 
 predicted <- lzn.kriged@data$var1.pred %>%
@@ -323,12 +300,36 @@ data_new <- grid %>%
   select(-optional) %>% 
   #mutate(freq_kriging= if_else(is.na(freq_kriging), freq_svd, freq_kriging)) # Kriging has NA values, replace with SVD by uncommenting this line and commenting next line
   na.omit() 
-
-mae(data_new$original_price, data_new$freq_svd)
-mae(data_new$original_price, data_new$freq_kriging)
-
 ###########################################################################
 
+
+
+# Method 3: GWR for Counties with Similar Spatial Structures to County Id 3101
+###########################################################################
+library(spgwr)
+
+# Filter to only county selected for outlier removal
+ml_spat <- temp %>% filter(COUNTY=="3101")
+
+ml_spat_sample <- ml_spat %>% filter(price_change_svd==0)
+GWRbandwidth <- gwr.sel(original_price ~ freq_svd + freq_svd_e, data=ml_spat_sample, coords=cbind(ml_spat_sample$longitude,ml_spat_sample$latitude),adapt=T)
+
+
+gwr.model = gwr(original_price ~ freq_svd + freq_svd_e, data=ml_spat_sample, coords=cbind(ml_spat_sample$longitude,ml_spat_sample$latitude), adapt=GWRbandwidth, hatmatrix=FALSE, se.fit=FALSE)
+
+coordinates(ml_spat_sample) <- c("longitude", "latitude")
+
+data_new <- ml_spat %>% filter(price_change_svd==1)
+coordinates(data_new) <- c("longitude", "latitude")
+
+# Run the gwr model
+gwr_results <- gwr(original_price ~  freq_svd, data=ml_spat_sample, adapt=GWRbandwidth, fit.points = data_new, predict=TRUE, se.fit=FALSE, fittedGWRobject=gwr.model)
+results <-as.data.frame(gwr_results$SDF)
+
+data_new <- data.frame(data_new)
+data_new$freq_gwr <- results$pred
+
+###########################################################################
 
 ```
 

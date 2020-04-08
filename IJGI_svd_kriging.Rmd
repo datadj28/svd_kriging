@@ -133,7 +133,7 @@ reader = Reader(rating_scale=(0,1))
 full_df = pd.DataFrame()
         
 print('Select Method...')
-algo = surprise.prediction_algorithms.matrix_factorization.NMF(n_factors=5, n_epochs=70, verbose=True, biased=True, lr_bu=.00000005)
+algo = surprise.prediction_algorithms.matrix_factorization.SVD(n_factors=5, n_epochs=70, verbose=True, biased=True, lr_bu=.00000005)
 # Apply SVD with SGD for every city
 city_list = pd.Series(ratings['COUNTY']).unique()
 for i in city_list:
